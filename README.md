@@ -173,6 +173,39 @@ sqlite3 data/vps-cron-history.db \
   "SELECT started_at, job, outcome, duration_ms FROM runs ORDER BY id DESC LIMIT 10;"
 ```
 
+## Running a job immediately
+
+```
+vps-cron run nightly-backup
+```
+
+It runs the job once, now, with its configured timeout, prints the result and exits. The run is recorded in the history exactly like a scheduled one, so it shows up in `GET /runs` alongside the rest.
+
+The exit code is `0` on success and `1` on failure or timeout, so it composes with `&&` and with anything that checks exit codes.
+
+```
+$ vps-cron run hello
+success: Command exited 0
+took 4 ms
+---
+bonjour depuis hello
+```
+
+Disabled jobs are runnable this way on purpose. Keeping a job in the file with `enabled = false` and triggering it by hand is a reasonable way to work, and the command says so rather than silently ignoring the flag.
+
+`vps-cron list` prints every configured job with its state, schedule and what it runs.
+
+### It is safe to use while the service is running
+
+The scheduler's in-process guard cannot see a `vps-cron run` typed in a terminal, so a manual run of a job the daemon was already running would otherwise have two processes writing the same files. Both take the same advisory lock file under `DATA_DIR/locks`, so whichever arrives second backs off:
+
+```
+$ vps-cron run slow
+Error: Job 'slow' is already running (the scheduler holds its lock). Try again once it finishes.
+```
+
+In the other direction the daemon logs a skip and records it, rather than piling a scheduled run on top of your manual one. Locks are advisory and released when the process exits, including on a crash, so a killed run never leaves a job wedged.
+
 ## Running it
 
 ```
@@ -180,6 +213,8 @@ cp .env.example .env    # then fill it in
 cargo build --release
 ./target/release/vps-cron
 ```
+
+With no arguments it runs the scheduler until stopped. `--help` lists the commands.
 
 As a systemd unit:
 
@@ -199,7 +234,7 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-Logs go to stdout and stderr, so `journalctl -u vps-cron -f` shows them. `RUST_LOG=debug` turns up the detail.
+Logs go to stdout and stderr, so `journalctl -u vps-cron -f` shows them. `RUST_LOG=debug` turns up the detail. One-shot commands log warnings and errors only unless `RUST_LOG` says otherwise, so their report is not buried under startup lines.
 
 ## Adding a builtin
 
@@ -213,7 +248,9 @@ Anything that does not need typed API access is better off as a shell job, which
 
 | Path | Contents |
 | --- | --- |
+| `src/cli.rs` | Command line parsing |
 | `src/job.rs` | The `Job` trait and the run record types |
+| `src/lock.rs` | Advisory job locks shared by the daemon and the CLI |
 | `src/jobs_file.rs` | Parsing and validation of `jobs.toml` |
 | `src/scheduler.rs` | The cron loop, overlap guard and timeouts |
 | `src/registry.rs` | Built-in lookup by name |

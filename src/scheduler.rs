@@ -23,6 +23,7 @@ use crate::builtins::shell::ShellJob;
 use crate::history::History;
 use crate::job::{Job, JobContext, JobFailure, JobReport, JobResult, Outcome, RunRecord};
 use crate::jobs_file::{JobKind, JobSpec, JobsFile};
+use crate::lock::LockDir;
 use crate::registry::Registry;
 
 /// Live status for every configured job, shared with the status server.
@@ -85,6 +86,7 @@ pub struct Scheduler {
     jobs: Vec<ScheduledJob>,
     status: SharedStatus,
     history: History,
+    locks: LockDir,
     /// Counts runs that finished, so tests and logs can observe progress.
     completed: Arc<AtomicU64>,
 }
@@ -95,7 +97,12 @@ impl Scheduler {
     /// Resolution happens up front so an unknown builtin or an unusable
     /// schedule stops the process at startup, rather than at 3am on the first
     /// occurrence.
-    pub fn build(file: JobsFile, registry: &Registry, history: History) -> Result<Self> {
+    pub fn build(
+        file: JobsFile,
+        registry: &Registry,
+        history: History,
+        locks: LockDir,
+    ) -> Result<Self> {
         let mut jobs = Vec::new();
         let mut status = BTreeMap::new();
 
@@ -109,12 +116,7 @@ impl Scheduler {
 
             let schedule = spec.parse_schedule()?;
 
-            let job: Arc<dyn Job> = match &spec.kind {
-                JobKind::Shell(command) => Arc::new(ShellJob::new(command.clone())),
-                JobKind::Builtin(name) => registry
-                    .resolve(name)
-                    .with_context(|| format!("Job '{}' could not be resolved", spec.name))?,
-            };
+            let job = resolve(&spec, registry)?;
 
             jobs.push(ScheduledJob {
                 spec,
@@ -128,6 +130,7 @@ impl Scheduler {
             jobs,
             status: Arc::new(RwLock::new(status)),
             history,
+            locks,
             completed: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -148,6 +151,7 @@ impl Scheduler {
             jobs,
             status,
             history,
+            locks,
             completed,
         } = self;
 
@@ -156,6 +160,7 @@ impl Scheduler {
                 let runner = Runner {
                     status: Arc::clone(&status),
                     history: history.clone(),
+                    locks: locks.clone(),
                     completed: Arc::clone(&completed),
                 };
                 tokio::spawn(async move { runner.drive(job).await })
@@ -169,6 +174,7 @@ impl Scheduler {
 struct Runner {
     status: SharedStatus,
     history: History,
+    locks: LockDir,
     completed: Arc<AtomicU64>,
 }
 
@@ -211,65 +217,60 @@ impl Runner {
         let name = job.spec.name.clone();
 
         let Ok(guard) = Arc::clone(&job.guard).try_lock_owned() else {
-            warn!(job = %name, "Previous run is still going, skipping this occurrence");
-            let now = Utc::now();
-            self.finish(
-                &name,
-                RunRecord {
-                    job: name.clone(),
-                    started_at: now,
-                    finished_at: now,
-                    duration_ms: 0,
-                    outcome: Outcome::Skipped,
-                    summary: "Skipped: the previous run was still going".to_string(),
-                    output: None,
-                },
-            )
-            .await;
+            self.skip(&name, "the previous run was still going").await;
             return;
+        };
+
+        // The in-process guard cannot see a `vps-cron run` in another
+        // terminal, so the file lock is what actually keeps the two apart.
+        let file_lock = match self.locks.try_acquire(&name) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                self.skip(&name, "another process holds this job's lock").await;
+                return;
+            }
+            Err(error) => {
+                error!(job = %name, "Failed to take the job lock: {error:#}");
+                return;
+            }
         };
 
         let runner = self.clone();
         tokio::spawn(async move {
-            // Holding the guard for the whole run is what makes the next
+            // Holding both guards for the whole run is what makes the next
             // occurrence skip rather than pile up.
             let _guard = guard;
+            let _file_lock = file_lock;
             runner.execute(&job).await;
         });
+    }
+
+    /// Records an occurrence that never ran.
+    async fn skip(&self, name: &str, reason: &str) {
+        warn!(job = %name, "Skipping this occurrence: {reason}");
+
+        let now = Utc::now();
+        self.finish(
+            name,
+            RunRecord {
+                job: name.to_string(),
+                started_at: now,
+                finished_at: now,
+                duration_ms: 0,
+                outcome: Outcome::Skipped,
+                summary: format!("Skipped: {reason}"),
+                output: None,
+            },
+        )
+        .await;
     }
 
     /// Runs the job, applies its timeout, and records the outcome.
     async fn execute(&self, job: &ScheduledJob) {
         let name = &job.spec.name;
-        let started_at = Utc::now();
-        let start = std::time::Instant::now();
 
         self.set_running(name, true).await;
-
-        let ctx = JobContext {
-            job_name: name,
-            args: &job.spec.args,
-            started_at,
-        };
-
-        // Timeouts are tracked as a flag rather than sniffed out of the error
-        // message later, so a job that legitimately reports "timed out" itself
-        // is not miscategorised.
-        let (outcome, timed_out) = match job.spec.timeout {
-            Some(limit) => match tokio::time::timeout(limit, job.job.run(&ctx)).await {
-                Ok(result) => (result, false),
-                Err(_) => (
-                    Err(JobFailure::new(format!(
-                        "Timed out after {}",
-                        humantime::format_duration(limit)
-                    ))),
-                    true,
-                ),
-            },
-            None => (job.job.run(&ctx).await, false),
-        };
-
-        let record = Self::to_record(name, started_at, start.elapsed(), outcome, timed_out);
+        let record = execute_once(&job.spec, job.job.as_ref()).await;
 
         match record.outcome {
             Outcome::Success => {
@@ -282,31 +283,6 @@ impl Runner {
 
         self.set_running(name, false).await;
         self.finish(name, record).await;
-    }
-
-    /// Turns a job result into the record written to the history.
-    fn to_record(
-        name: &str,
-        started_at: DateTime<Utc>,
-        elapsed: Duration,
-        outcome: JobResult,
-        timed_out: bool,
-    ) -> RunRecord {
-        let (result, summary, output) = match outcome {
-            Ok(JobReport { summary, output }) => (Outcome::Success, summary, output),
-            Err(failure) if timed_out => (Outcome::Timeout, failure.message, failure.output),
-            Err(failure) => (Outcome::Failure, failure.message, failure.output),
-        };
-
-        RunRecord {
-            job: name.to_string(),
-            started_at,
-            finished_at: Utc::now(),
-            duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-            outcome: result,
-            summary,
-            output,
-        }
     }
 
     /// Publishes a finished run to the status map and the history database.
@@ -352,6 +328,76 @@ impl Runner {
         if let Some(entry) = status.get_mut(name) {
             entry.next_run = next;
         }
+    }
+}
+
+/// Resolves one job declaration into something runnable.
+///
+/// Shared by the scheduler and by `vps-cron run`, so a job behaves identically
+/// whether a timer or a person started it.
+pub fn resolve(spec: &JobSpec, registry: &Registry) -> Result<Arc<dyn Job>> {
+    match &spec.kind {
+        JobKind::Shell(command) => Ok(Arc::new(ShellJob::new(command.clone()))),
+        JobKind::Builtin(name) => registry
+            .resolve(name)
+            .with_context(|| format!("Job '{}' could not be resolved", spec.name)),
+    }
+}
+
+/// Runs a job once, applying its timeout, and returns the record.
+///
+/// This is the single place a job actually gets executed. Timeouts are tracked
+/// as a flag rather than sniffed out of the error message afterwards, so a job
+/// that legitimately reports "timed out" itself is not miscategorised.
+pub async fn execute_once(spec: &JobSpec, job: &dyn Job) -> RunRecord {
+    let started_at = Utc::now();
+    let start = std::time::Instant::now();
+
+    let ctx = JobContext {
+        job_name: &spec.name,
+        args: &spec.args,
+        started_at,
+    };
+
+    let (outcome, timed_out) = match spec.timeout {
+        Some(limit) => match tokio::time::timeout(limit, job.run(&ctx)).await {
+            Ok(result) => (result, false),
+            Err(_) => (
+                Err(JobFailure::new(format!(
+                    "Timed out after {}",
+                    humantime::format_duration(limit)
+                ))),
+                true,
+            ),
+        },
+        None => (job.run(&ctx).await, false),
+    };
+
+    to_record(&spec.name, started_at, start.elapsed(), outcome, timed_out)
+}
+
+/// Turns a job result into the record written to the history.
+fn to_record(
+    name: &str,
+    started_at: DateTime<Utc>,
+    elapsed: Duration,
+    outcome: JobResult,
+    timed_out: bool,
+) -> RunRecord {
+    let (result, summary, output) = match outcome {
+        Ok(JobReport { summary, output }) => (Outcome::Success, summary, output),
+        Err(failure) if timed_out => (Outcome::Timeout, failure.message, failure.output),
+        Err(failure) => (Outcome::Failure, failure.message, failure.output),
+    };
+
+    RunRecord {
+        job: name.to_string(),
+        started_at,
+        finished_at: Utc::now(),
+        duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        outcome: result,
+        summary,
+        output,
     }
 }
 
