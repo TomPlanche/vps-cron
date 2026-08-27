@@ -118,7 +118,11 @@ impl LastFmSettings {
     fn from_env(data_dir: &str) -> Option<Self> {
         let username = non_empty_env("LAST_FM_USERNAME")?;
 
-        let destination_folder = env_or(data_dir, "DESTINATION_FOLDER");
+        let destination_folder = resolve_folder(
+            non_empty_env("LAST_FM_DESTINATION_FOLDER"),
+            non_empty_env("DESTINATION_FOLDER"),
+            data_dir,
+        );
 
         let db_file = std::env::var("LAST_FM_DB_FILE")
             .or_else(|_| std::env::var("DB_FILE"))
@@ -150,7 +154,11 @@ impl GitHubSettings {
     fn from_env(data_dir: &str) -> Option<Self> {
         Some(Self {
             token: non_empty_env("GITHUB_TOKEN")?,
-            destination_folder: env_or(data_dir, "GITHUB_DESTINATION_FOLDER"),
+            destination_folder: resolve_folder(
+                non_empty_env("GITHUB_DESTINATION_FOLDER"),
+                non_empty_env("DESTINATION_FOLDER"),
+                data_dir,
+            ),
             gist: non_empty_env("GIST_ID").map(|id| GistTarget {
                 id,
                 filename: non_empty_env("GIST_FILENAME")
@@ -176,6 +184,49 @@ fn non_empty_env(key: &str) -> Option<String> {
 /// Reads an environment variable, falling back to `default`.
 fn env_or(default: &str, key: &str) -> String {
     non_empty_env(key).unwrap_or_else(|| default.to_string())
+}
+
+/// Picks where an integration writes its files.
+///
+/// The order is deliberate. `DESTINATION_FOLDER` reads as a global setting, so
+/// it behaves like one and covers every integration that writes files; the
+/// per-integration variable is there to send one of them somewhere else.
+///
+/// Taking the environment as arguments rather than reading it here keeps this
+/// testable: process environment is global state, and mutating it inside tests
+/// that run in parallel is a race.
+fn resolve_folder(specific: Option<String>, general: Option<String>, data_dir: &str) -> String {
+    specific
+        .or(general)
+        .unwrap_or_else(|| data_dir.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_specific_variable_wins() {
+        let folder = resolve_folder(
+            Some("/srv/github".to_string()),
+            Some("/srv/shared".to_string()),
+            "./data",
+        );
+        assert_eq!(folder, "/srv/github");
+    }
+
+    #[test]
+    fn the_general_variable_covers_every_integration() {
+        // The case that bit in production: DESTINATION_FOLDER set, no
+        // per-integration override, and the export landing in ./data.
+        let folder = resolve_folder(None, Some("/srv/shared".to_string()), "./data");
+        assert_eq!(folder, "/srv/shared");
+    }
+
+    #[test]
+    fn the_data_directory_is_the_last_resort() {
+        assert_eq!(resolve_folder(None, None, "./data"), "./data");
+    }
 }
 
 /// Creates `dir` if needed, rejecting a path already taken by a file.

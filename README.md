@@ -138,17 +138,24 @@ Copy `.env.example` to `.env` and fill in what you need. Only the manager's own 
 | --- | --- | --- |
 | `JOBS_FILE` | `./jobs.toml` | Path to the jobs file |
 | `DATA_DIR` | `./data` | Generated files and the run history database |
+| `DESTINATION_FOLDER` | `DATA_DIR` | Where every file-writing builtin puts its output |
 | `HTTP_ADDR` | `127.0.0.1:8787` | Status server address; set to an empty string to disable it |
 | `HISTORY_RETENTION_DAYS` | `30` | How long to keep run history |
 | `RUST_LOG` | `info` | Log level |
 | `LAST_FM_USERNAME` | unset | Enables the Last.fm built-ins |
 | `LAST_FM_API_KEY` | unset | Last.fm API key |
-| `DESTINATION_FOLDER` | `DATA_DIR` | Where the Last.fm JSON exports are written |
+| `LAST_FM_DESTINATION_FOLDER` | `DESTINATION_FOLDER` | Overrides the destination for the Last.fm exports only |
 | `LAST_FM_DB_FILE` | `DATA_DIR/scrobbles.db` | Scrobble history database |
 | `GITHUB_TOKEN` | unset | Enables the GitHub built-ins |
-| `GITHUB_DESTINATION_FOLDER` | `DATA_DIR` | Where the GitHub exports are written |
+| `GITHUB_DESTINATION_FOLDER` | `DESTINATION_FOLDER` | Overrides the destination for the GitHub exports only |
 | `GIST_ID` | unset | Target gist, needed only by the gist job |
 | `GIST_FILENAME` | `top-tracks.md` | File within the gist to overwrite |
+
+### Where files are written
+
+Builtins that write files resolve their destination in this order: the per-integration variable, then `DESTINATION_FOLDER`, then `DATA_DIR`. So setting `DESTINATION_FOLDER` alone sends every export to one place, which is usually what you want, and `GITHUB_DESTINATION_FOLDER` or `LAST_FM_DESTINATION_FOLDER` peels one of them off when you need it elsewhere.
+
+The `filename` argument is then joined onto that folder, with the path rules described above.
 
 ## Status server
 
