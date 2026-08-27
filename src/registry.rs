@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 
+use crate::builtins::github::Activity;
 use crate::builtins::lastfm::{CurrentTrack, LastFm, RecentPlays, ScrobblesDb, TopTracksGist};
+use crate::config::GitHubSettings;
 use crate::job::Job;
 
 /// Built-in jobs available to the jobs file, keyed by name.
@@ -32,6 +34,12 @@ impl Registry {
         self.insert("lastfm_scrobbles_db", Arc::new(ScrobblesDb(Arc::clone(&lastfm))));
         self.insert("lastfm_top_tracks_gist", Arc::new(TopTracksGist(lastfm)));
         self
+    }
+
+    /// Adds the GitHub built-ins.
+    pub fn with_github(mut self, settings: Arc<GitHubSettings>) -> Result<Self> {
+        self.insert("github_activity", Arc::new(Activity::new(settings)?));
+        Ok(self)
     }
 
     /// Registers one built-in under `name`.

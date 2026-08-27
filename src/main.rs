@@ -88,24 +88,37 @@ async fn main() -> Result<()> {
 /// A host with no Last.fm credentials still gets a working manager; it just
 /// has no Last.fm built-ins to reference.
 fn build_registry(config: &Config) -> Result<Registry> {
+    let mut registry = Registry::new();
+
+    match &config.github {
+        Some(github) => {
+            github.ensure_destination_folder()?;
+            if github.gist.is_none() {
+                info!("GIST_ID is unset, the gist builtin will fail if scheduled");
+            }
+            registry = registry.with_github(Arc::clone(github))?;
+        }
+        None => info!("GITHUB_TOKEN is unset, GitHub builtins are not registered"),
+    }
+
     let Some(settings) = &config.lastfm else {
         info!("LAST_FM_USERNAME is unset, Last.fm builtins are not registered");
-        return Ok(Registry::new());
+        return Ok(registry);
     };
 
     settings.ensure_destination_folder()?;
-
-    if settings.gist.is_none() {
-        info!("GITHUB_TOKEN or GIST_ID is unset, the gist builtin will fail if scheduled");
-    }
 
     let client = LastFmClient::new()
         .map_err(|e| anyhow::anyhow!("{e:?}"))
         .context("Failed to create the Last.fm client")?;
 
-    let lastfm = Arc::new(LastFm::new(Arc::new(client), Arc::clone(settings)));
+    let lastfm = Arc::new(LastFm::new(
+        Arc::new(client),
+        Arc::clone(settings),
+        config.github.clone(),
+    ));
 
-    Ok(Registry::new().with_lastfm(lastfm))
+    Ok(registry.with_lastfm(lastfm))
 }
 
 /// Periodically trims the run history so it stays bounded.

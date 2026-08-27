@@ -28,10 +28,33 @@ pub struct Config {
     pub http_addr: Option<String>,
     /// How many days of run history to keep.
     pub history_days: u32,
+    /// GitHub settings, present only when a token is configured.
+    pub github: Option<Arc<GitHubSettings>>,
     /// Last.fm settings, present only when the environment supplies them.
     ///
     /// Shared behind an `Arc` because every Last.fm built-in holds onto it.
     pub lastfm: Option<Arc<LastFmSettings>>,
+}
+
+/// Credentials and paths for the GitHub built-ins.
+///
+/// The token lives here rather than under Last.fm because it is a
+/// GitHub-wide concern: the activity job needs it without any gist involved.
+pub struct GitHubSettings {
+    /// A GitHub personal access token.
+    pub token: String,
+    /// Where the GitHub exports are written.
+    pub destination_folder: String,
+    /// Gist target, present only when a gist ID is configured.
+    pub gist: Option<GistTarget>,
+}
+
+/// Where the gist built-in publishes.
+pub struct GistTarget {
+    /// The target gist ID.
+    pub id: String,
+    /// The file within the gist to overwrite.
+    pub filename: String,
 }
 
 /// Credentials and paths for the Last.fm built-ins.
@@ -42,18 +65,6 @@ pub struct LastFmSettings {
     pub destination_folder: String,
     /// Path to the scrobble history database.
     pub db_file: String,
-    /// Gist target, present only when a token and gist ID are configured.
-    pub gist: Option<GistSettings>,
-}
-
-/// Where the gist built-in publishes.
-pub struct GistSettings {
-    /// A GitHub token with the `gist` scope.
-    pub token: String,
-    /// The target gist ID.
-    pub id: String,
-    /// The file within the gist to overwrite.
-    pub filename: String,
 }
 
 impl Config {
@@ -85,6 +96,7 @@ impl Config {
 
         Ok(Self {
             jobs_file,
+            github: GitHubSettings::from_env(&data_dir).map(Arc::new),
             lastfm: LastFmSettings::from_env(&data_dir).map(Arc::new),
             data_dir,
             http_addr,
@@ -121,7 +133,6 @@ impl LastFmSettings {
             username,
             destination_folder,
             db_file,
-            gist: GistSettings::from_env(),
         })
     }
 
@@ -131,15 +142,26 @@ impl LastFmSettings {
     }
 }
 
-impl GistSettings {
-    /// Reads the gist target, returning `None` unless both token and ID are set.
-    fn from_env() -> Option<Self> {
+impl GitHubSettings {
+    /// Reads the GitHub settings, returning `None` when no token is set.
+    ///
+    /// `GITHUB_TOKEN` is the switch. The gist target is separate: a token with
+    /// no `GIST_ID` still powers the activity job.
+    fn from_env(data_dir: &str) -> Option<Self> {
         Some(Self {
             token: non_empty_env("GITHUB_TOKEN")?,
-            id: non_empty_env("GIST_ID")?,
-            filename: non_empty_env("GIST_FILENAME")
-                .unwrap_or_else(|| "top-tracks.md".to_string()),
+            destination_folder: env_or(data_dir, "GITHUB_DESTINATION_FOLDER"),
+            gist: non_empty_env("GIST_ID").map(|id| GistTarget {
+                id,
+                filename: non_empty_env("GIST_FILENAME")
+                    .unwrap_or_else(|| "top-tracks.md".to_string()),
+            }),
         })
+    }
+
+    /// Creates the folder the GitHub exports are written to.
+    pub fn ensure_destination_folder(&self) -> Result<()> {
+        ensure_dir(&self.destination_folder)
     }
 }
 

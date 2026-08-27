@@ -42,6 +42,18 @@ args = { limit = 5, period = "week" }
 timeout = "2m"
 
 # ---------------------------------------------------------------------------
+# GitHub
+# Needs GITHUB_TOKEN. Only public data is exported.
+# ---------------------------------------------------------------------------
+
+[[jobs]]
+name = "github-activity"
+schedule = "0 15 * * * *"       # hourly, at minute 15
+kind = { builtin = "github_activity" }
+timeout = "2m"
+args = { filename = "github_activity.json", issues_limit = 20, prs_limit = 20, starred_limit = 30, repos_limit = 100, review_requests_limit = 20 }
+
+# ---------------------------------------------------------------------------
 # Shell jobs. Anything a crontab can run, this can run.
 # The examples below are disabled; enable and adapt them as needed.
 # ---------------------------------------------------------------------------

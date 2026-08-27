@@ -9,14 +9,14 @@
 //! configured, so an install that never touches Last.fm is not obliged to
 //! provide credentials.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use lastfm_client::{api::Period, prelude::*, LastFmClient};
 
-use crate::config::LastFmSettings;
+use crate::builtins::write_json;
+use crate::config::{GitHubSettings, LastFmSettings};
 use crate::job::{Job, JobContext, JobReport, JobResult};
 use crate::update_gist::{format_top_tracks_markdown, update_gist};
 
@@ -26,12 +26,22 @@ pub struct LastFm {
     pub client: Arc<LastFmClient>,
     /// Credentials and paths read from the environment.
     pub settings: Arc<LastFmSettings>,
+    /// GitHub settings, needed only by the gist job.
+    pub github: Option<Arc<GitHubSettings>>,
 }
 
 impl LastFm {
     /// Bundles a client and settings for the registry.
-    pub fn new(client: Arc<LastFmClient>, settings: Arc<LastFmSettings>) -> Self {
-        Self { client, settings }
+    pub fn new(
+        client: Arc<LastFmClient>,
+        settings: Arc<LastFmSettings>,
+        github: Option<Arc<GitHubSettings>>,
+    ) -> Self {
+        Self {
+            client,
+            settings,
+            github,
+        }
     }
 }
 
@@ -133,10 +143,16 @@ impl Job for TopTracksGist {
     async fn run(&self, ctx: &JobContext<'_>) -> JobResult {
         let settings = &self.0.settings;
 
-        let gist = settings
+        let github = self
+            .0
+            .github
+            .as_ref()
+            .context("GITHUB_TOKEN must be set to update a gist")?;
+
+        let gist = github
             .gist
             .as_ref()
-            .context("GITHUB_TOKEN and GIST_ID must be set to update a gist")?;
+            .context("GIST_ID must be set to update a gist")?;
 
         let limit = ctx.arg_u32("limit").unwrap_or(5);
         let period = parse_period(ctx.arg_str("period").unwrap_or("week"))?;
@@ -157,7 +173,7 @@ impl Job for TopTracksGist {
         top_tracks.sort_by_key(|t| std::cmp::Reverse(t.playcount));
         let content = format_top_tracks_markdown(&top_tracks);
 
-        update_gist(&content, &gist.token, gist_id, gist_filename)
+        update_gist(&content, &github.token, gist_id, gist_filename)
             .await
             .map_err(|e| anyhow!("{e}"))
             .context("Failed to update the gist")?;
@@ -168,21 +184,6 @@ impl Job for TopTracksGist {
         ))
         .with_output(content))
     }
-}
-
-/// Serialises `value` as pretty JSON into `folder/filename`.
-///
-/// Returns the path written, for the run summary.
-fn write_json<T: serde::Serialize>(folder: &str, filename: &str, value: &T) -> anyhow::Result<String> {
-    let path = Path::new(folder).join(filename);
-
-    let json = serde_json::to_string_pretty(value)
-        .with_context(|| format!("Failed to serialise {filename}"))?;
-
-    std::fs::write(&path, json)
-        .with_context(|| format!("Failed to write '{}'", path.display()))?;
-
-    Ok(path.display().to_string())
 }
 
 /// Maps a jobs-file `period` argument onto the Last.fm period.

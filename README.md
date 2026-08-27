@@ -60,6 +60,14 @@ kind = { shell = { command = "make deploy", workdir = "/srv/app", env = { RUST_L
 
 Two variables are always set for the command: `VPS_CRON_JOB` holds the job name and `VPS_CRON_STARTED_AT` holds the run's start time in RFC 3339.
 
+### The `filename` argument
+
+Built-ins that write a file take a `filename` argument, joined onto the job's destination folder. Missing parent directories are created, so `exports/today.json` works out of the box.
+
+Two consequences of that join are worth knowing. A relative path escapes the folder: `../public/now.json` resolves against the folder and lands outside it, which is a fine way to write into a directory served by nginx. An absolute path replaces the folder entirely, so `/var/www/html/now.json` ignores the configured destination altogether. Both are deliberate.
+
+A leading `~` is rejected with an explicit error. Shells expand it, this does not, and creating a directory literally named `~` is never what anyone meant.
+
 ### Built-in jobs
 
 Built-ins are compiled in, so they can share one API client and keep typed access to the API. The Last.fm ones are registered only when `LAST_FM_USERNAME` is set.
@@ -70,10 +78,57 @@ Built-ins are compiled in, so they can share one API client and keep typed acces
 | `lastfm_current_track` | `filename` (`currently_listening.json`) | Writes the currently playing track as JSON |
 | `lastfm_scrobbles_db` | `db_file` (`LAST_FM_DB_FILE`) | Appends new scrobbles to the SQLite listening history |
 | `lastfm_top_tracks_gist` | `limit` (5), `period` (`week`), `gist_id`, `gist_filename` | Renders top tracks as Markdown and pushes them to a GitHub gist |
+| `github_activity` | `filename` (`github_activity.json`), `issues_limit` (20), `prs_limit` (20), `starred_limit` (30), `repos_limit` (100), `review_requests_limit` (20) | Snapshots your GitHub activity as typed JSON |
 
 `period` accepts `overall`, `week`, `month`, `3month`, `6month` and `12month`.
 
+The GitHub built-ins need `GITHUB_TOKEN`. `github_activity` reads public data only, so a token with no scopes at all is enough; `lastfm_top_tracks_gist` additionally needs the `gist` scope.
+
 Referencing a builtin that is not registered fails at startup with the list of names that are, which is usually the clue that a credential is missing.
+
+### GitHub activity
+
+`github_activity` writes one JSON snapshot per run, overwriting the previous one. Everything comes from a single GraphQL request, so it costs one point of your 5000/hour budget.
+
+```json
+{
+  "fetched_at": "2026-08-27T15:15:00Z",
+  "login": "your-login",
+  "issues": [
+    { "number": 7, "title": "...", "url": "...", "state": "OPEN",
+      "repository": "owner/repo", "comments": 3,
+      "created_at": "...", "updated_at": "..." }
+  ],
+  "pull_requests": [
+    { "number": 12, "title": "...", "url": "...", "state": "MERGED",
+      "repository": "owner/repo", "additions": 40, "deletions": 5,
+      "created_at": "...", "updated_at": "...", "merged_at": "..." }
+  ],
+  "review_requests": [
+    { "number": 3, "title": "...", "url": "...",
+      "repository": "owner/repo", "author": "someone", "created_at": "..." }
+  ],
+  "starred": [
+    { "repository": "rust-lang/rust", "url": "...", "description": null,
+      "stars": 99000, "language": "Rust", "starred_at": "..." }
+  ],
+  "repositories": {
+    "total": 12, "counted": 12, "stars_received": 137,
+    "items": [
+      { "repository": "owner/repo", "url": "...", "description": "...",
+        "stars": 100, "forks": 4, "language": "Rust" }
+    ]
+  },
+  "rate_limit": { "remaining": 4987, "resets_at": "..." }
+}
+```
+
+Things worth knowing about the shape:
+
+- `state` is GitHub's own spelling: `OPEN` or `CLOSED` for issues, and `OPEN`, `CLOSED` or `MERGED` for pull requests.
+- `repositories.stars_received` sums only the `counted` repositories. If you own more than `repos_limit`, it is a lower bound, though the list is ordered by stars so the ones that matter are included first.
+- `author` is `null` when the account behind a review request has been deleted. `description` and `language` are `null` whenever GitHub has none.
+- Private data is filtered out in code, not merely left out by the token's scopes. Granting the token `repo` access later for some other reason will not start leaking private repository names into this file.
 
 ## Environment
 
@@ -90,8 +145,9 @@ Copy `.env.example` to `.env` and fill in what you need. Only the manager's own 
 | `LAST_FM_API_KEY` | unset | Last.fm API key |
 | `DESTINATION_FOLDER` | `DATA_DIR` | Where the Last.fm JSON exports are written |
 | `LAST_FM_DB_FILE` | `DATA_DIR/scrobbles.db` | Scrobble history database |
-| `GITHUB_TOKEN` | unset | Token with the `gist` scope |
-| `GIST_ID` | unset | Target gist |
+| `GITHUB_TOKEN` | unset | Enables the GitHub built-ins |
+| `GITHUB_DESTINATION_FOLDER` | `DATA_DIR` | Where the GitHub exports are written |
+| `GIST_ID` | unset | Target gist, needed only by the gist job |
 | `GIST_FILENAME` | `top-tracks.md` | File within the gist to overwrite |
 
 ## Status server
@@ -163,5 +219,5 @@ Anything that does not need typed API access is better off as a shell job, which
 | `src/registry.rs` | Built-in lookup by name |
 | `src/history.rs` | SQLite run history |
 | `src/http.rs` | Status server |
-| `src/builtins/` | Job implementations |
+| `src/builtins/` | Job implementations, plus the shared JSON writer |
 | `src/config.rs` | Environment configuration |
