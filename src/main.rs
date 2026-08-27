@@ -1,178 +1,134 @@
-use lastfm_client::{LastFmClient, api::Period, prelude::*};
-use chrono::Utc;
-use cron::Schedule;
-use std::str::FromStr;
-use tokio::time::{sleep, Duration};
+//! vps-cron: a small cron manager for a single VPS.
+//!
+//! Jobs are declared in a TOML file, not in code. Each one is either a shell
+//! command or a built-in compiled into the binary, and the scheduler gives all
+//! of them the same treatment: overlap protection, optional timeouts,
+//! structured logs and a row in the run history.
 
-mod update_gist;
-use update_gist::{format_top_tracks_markdown, update_gist};
+use std::sync::Arc;
 
+use anyhow::{Context, Result};
+use lastfm_client::LastFmClient;
+use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
+
+mod builtins;
 mod config;
+mod history;
+mod http;
+mod job;
+mod jobs_file;
+mod registry;
+mod scheduler;
+mod update_gist;
+
+use builtins::lastfm::LastFm;
 use config::Config;
+use history::History;
+use jobs_file::JobsFile;
+use registry::Registry;
+use scheduler::Scheduler;
 
-/// Fetches the recent play counts from Last.fm and exports them to a JSON file.
-///
-/// # Arguments
-/// * `client` - A reference to the `LastFmClient` instance.
-/// * `username` - The Last.fm username to fetch tracks for.
-/// * `destination_folder` - The folder where the JSON file will be exported.
-async fn fetch_recent_play_counts(client: &LastFmClient, username: &str, destination_folder: &str) {
-    let expression = "0 0/1 * * * *"; // Every minute
-    let schedule = Schedule::from_str(expression).expect("Failed to parse CRON expression");
-
-    loop {
-        let now = Utc::now();
-        if let Some(next) = schedule.upcoming(Utc).take(1).next() {
-            let until_next = next - now;
-            sleep(Duration::from_secs(
-                u64::try_from(until_next.num_seconds()).unwrap_or_default(),
-            ))
-            .await;
-
-            match client.recent_tracks(username).limit(100).fetch().await {
-                Ok(tracks) => {
-                    let path = format!("{destination_folder}/recent_play_counts.json");
-                    match serde_json::to_string_pretty(&tracks) {
-                        Ok(json) => {
-                            if let Err(e) = std::fs::write(&path, json) {
-                                eprintln!("Failed to write recent play counts: {e:?}");
-                            }
-                        }
-                        Err(e) => eprintln!("Failed to serialize recent play counts: {e:?}"),
-                    }
-                }
-                Err(e) => eprintln!("Failed to fetch recent play counts: {e:?}"),
-            }
-        }
-    }
-}
-
-/// Fetches the current track from Last.fm and exports it to a JSON file.
-///
-/// # Arguments
-/// * `client` - A reference to the `LastFmClient` instance.
-/// * `username` - The Last.fm username to fetch the current track for.
-/// * `destination_folder` - The folder where the JSON file will be saved.
-async fn fetch_current_track(client: &LastFmClient, username: &str, destination_folder: &str) {
-    let expression = "0/5 * * * * *"; // Each 5 seconds
-    let schedule = Schedule::from_str(expression).expect("Failed to parse CRON expression");
-
-    loop {
-        let now = Utc::now();
-        if let Some(next) = schedule.upcoming(Utc).take(1).next() {
-            let until_next = next - now;
-            sleep(Duration::from_secs(
-                u64::try_from(until_next.num_seconds()).unwrap_or_default(),
-            ))
-            .await;
-
-            match client.recent_tracks(username).limit(1).fetch().await {
-                Ok(tracks) => {
-                    let path = format!("{destination_folder}/currently_listening.json");
-                    match serde_json::to_string_pretty(&tracks) {
-                        Ok(json) => {
-                            if let Err(e) = std::fs::write(&path, json) {
-                                eprintln!("Failed to write current track: {e:?}");
-                            }
-                        }
-                        Err(e) => eprintln!("Failed to serialize current track: {e:?}"),
-                    }
-                }
-                Err(e) => eprintln!("Failed to fetch current track: {e:?}"),
-            }
-        }
-    }
-}
-
-/// Hourly job: fetch user top tracks and update the configured GitHub gist.
-///
-/// - Runs at `minute 0` of every hour using a cron schedule
-/// - Fetches top tracks for the configured period and limit
-/// - Renders Markdown via `format_top_tracks_markdown`
-/// - Updates the gist content, logging (but not crashing) on errors
-async fn update_top_tracks_gist(client: &LastFmClient, username: &str, cfg: &Config) {
-    // Every hour, at minute 0
-    let expression = "0 0 * * * *";
-    let schedule = Schedule::from_str(expression).expect("Failed to parse CRON expression");
-
-    loop {
-        let now = Utc::now();
-        if let Some(next) = schedule.upcoming(Utc).take(1).next() {
-            let until_next = next - now;
-            sleep(Duration::from_secs(
-                u64::try_from(until_next.num_seconds()).unwrap_or_default(),
-            ))
-            .await;
-
-            match client
-                .top_tracks(username)
-                .limit(5)
-                .period(Period::Week)
-                .fetch()
-                .await
-            {
-                Ok(mut top_tracks) => {
-                    top_tracks.sort_by_key(|t| std::cmp::Reverse(t.playcount));
-
-                    let content = format_top_tracks_markdown(&top_tracks);
-
-                    if let Err(e) = update_gist(
-                        &content,
-                        &cfg.github_token,
-                        &cfg.gist_id,
-                        &cfg.gist_filename,
-                    )
-                    .await
-                    {
-                        eprintln!("Failed to update gist: {e:?}");
-                    }
-                }
-                Err(e) => eprintln!("Failed to fetch top tracks: {e:?}"),
-            }
-        }
-    }
-}
-
-async fn update_scrobbles_db(client: &LastFmClient, username: &str, db_file: &str) {
-    let expression = "0 0/1 * * * *"; // Every minute
-    let schedule = Schedule::from_str(expression).expect("Failed to parse CRON expression");
-
-    loop {
-        if let Err(e) = client
-            .recent_tracks(username)
-            .fetch_extended_and_update_sqlite(db_file)
-            .await
-        {
-            eprintln!("Failed to update scrobbles db: {e:?}");
-        }
-
-        let now = Utc::now();
-        if let Some(next) = schedule.upcoming(Utc).take(1).next() {
-            let until_next = next - now;
-            sleep(Duration::from_secs(
-                u64::try_from(until_next.num_seconds()).unwrap_or_default(),
-            ))
-            .await;
-        }
-    }
-}
+/// How often to prune the run history.
+const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     dotenv::dotenv().ok();
+    init_tracing();
 
-    let cfg = Config::load().expect("Missing or invalid configuration");
-    cfg.ensure_destination_folder()
-        .expect("Failed to ensure destination folder");
+    let config = Config::from_env().context("Invalid configuration")?;
+    config.ensure_data_dir()?;
 
-    let client = LastFmClient::new().expect("Failed to create Last.fm client");
-    let username = cfg.last_fm_username.clone();
-    let destination_folder = cfg.destination_folder.clone();
+    let jobs_file = JobsFile::load(&config.jobs_file)?;
+    let registry = build_registry(&config)?;
 
-    tokio::join!(
-        fetch_recent_play_counts(&client, &username, &destination_folder),
-        fetch_current_track(&client, &username, &destination_folder),
-        update_scrobbles_db(&client, &username, &cfg.db_file),
-        update_top_tracks_gist(&client, &username, &cfg)
+    let history = History::open(&history::default_path(&config.data_dir))?;
+    let scheduler = Scheduler::build(jobs_file, &registry, history.clone())?;
+
+    if scheduler.enabled_count() == 0 {
+        warn!(
+            "No enabled jobs in '{}'. The manager will idle.",
+            config.jobs_file.display()
+        );
+    }
+
+    let status = scheduler.status();
+
+    if let Some(addr) = config.http_addr.clone() {
+        let (status, history) = (Arc::clone(&status), history.clone());
+        tokio::spawn(async move {
+            if let Err(error) = http::serve(&addr, status, history).await {
+                error!("Status server failed: {error:#}");
+            }
+        });
+    }
+
+    spawn_pruner(history, config.history_days);
+
+    info!(
+        jobs = scheduler.enabled_count(),
+        file = %config.jobs_file.display(),
+        "vps-cron started"
     );
+
+    scheduler.spawn();
+
+    // Job tasks run forever, so the process lives until it is told to stop.
+    tokio::signal::ctrl_c()
+        .await
+        .context("Failed to listen for shutdown")?;
+
+    info!("Shutting down");
+    Ok(())
+}
+
+/// Builds the registry, adding the Last.fm built-ins when configured.
+///
+/// A host with no Last.fm credentials still gets a working manager; it just
+/// has no Last.fm built-ins to reference.
+fn build_registry(config: &Config) -> Result<Registry> {
+    let Some(settings) = &config.lastfm else {
+        info!("LAST_FM_USERNAME is unset, Last.fm builtins are not registered");
+        return Ok(Registry::new());
+    };
+
+    settings.ensure_destination_folder()?;
+
+    if settings.gist.is_none() {
+        info!("GITHUB_TOKEN or GIST_ID is unset, the gist builtin will fail if scheduled");
+    }
+
+    let client = LastFmClient::new()
+        .map_err(|e| anyhow::anyhow!("{e:?}"))
+        .context("Failed to create the Last.fm client")?;
+
+    let lastfm = Arc::new(LastFm::new(Arc::new(client), Arc::clone(settings)));
+
+    Ok(Registry::new().with_lastfm(lastfm))
+}
+
+/// Periodically trims the run history so it stays bounded.
+fn spawn_pruner(history: History, keep_days: u32) {
+    tokio::spawn(async move {
+        loop {
+            match history.prune(keep_days).await {
+                Ok(0) => {}
+                Ok(deleted) => info!(deleted, keep_days, "Pruned old runs from the history"),
+                Err(error) => error!("Failed to prune the run history: {error:#}"),
+            }
+            tokio::time::sleep(PRUNE_INTERVAL).await;
+        }
+    });
+}
+
+/// Sets up structured logging, honouring `RUST_LOG`.
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,vps_cron=info"));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
 }

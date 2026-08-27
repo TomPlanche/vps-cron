@@ -1,0 +1,67 @@
+# vps-cron jobs.
+#
+# Schedules are six-field cron expressions: second minute hour day month weekday.
+# Edit this file and restart the service; no rebuild is needed.
+#
+# Every job accepts:
+#   enabled       run it at all (default true)
+#   timeout       kill the run after this long, e.g. "10m" (default: no limit)
+#   run_on_start  run once at startup instead of waiting (default false)
+#   args          parameters passed to the job
+
+# ---------------------------------------------------------------------------
+# Last.fm
+# These need LAST_FM_USERNAME in the environment; the gist job also needs
+# GITHUB_TOKEN and GIST_ID.
+# ---------------------------------------------------------------------------
+
+[[jobs]]
+name = "lastfm-recent-plays"
+schedule = "0 0/1 * * * *"      # every minute
+kind = { builtin = "lastfm_recent_plays" }
+args = { limit = 100, filename = "recent_play_counts.json" }
+
+[[jobs]]
+name = "lastfm-current-track"
+schedule = "0/5 * * * * *"      # every 5 seconds
+kind = { builtin = "lastfm_current_track" }
+args = { filename = "currently_listening.json" }
+
+[[jobs]]
+name = "lastfm-scrobbles-db"
+schedule = "0 0/1 * * * *"      # every minute
+kind = { builtin = "lastfm_scrobbles_db" }
+run_on_start = true
+timeout = "5m"
+
+[[jobs]]
+name = "lastfm-top-tracks-gist"
+schedule = "0 0 * * * *"        # hourly, on the hour
+kind = { builtin = "lastfm_top_tracks_gist" }
+args = { limit = 5, period = "week" }
+timeout = "2m"
+
+# ---------------------------------------------------------------------------
+# Shell jobs. Anything a crontab can run, this can run.
+# The examples below are disabled; enable and adapt them as needed.
+# ---------------------------------------------------------------------------
+
+# [[jobs]]
+# name = "disk-usage"
+# schedule = "0 0 * * * *"        # hourly
+# enabled = false
+# kind = { shell = "df -h /" }
+
+# [[jobs]]
+# name = "nightly-backup"
+# schedule = "0 0 3 * * *"        # 03:00 daily
+# enabled = false
+# timeout = "1h"
+# kind = { shell = { command = "restic backup /srv", workdir = "/srv", env = { RESTIC_REPOSITORY = "/mnt/backups" } } }
+
+# [[jobs]]
+# name = "certbot-renew"
+# schedule = "0 30 4 * * 1"       # 04:30 every Monday
+# enabled = false
+# timeout = "10m"
+# kind = { shell = "certbot renew --quiet && systemctl reload nginx" }

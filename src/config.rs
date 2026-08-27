@@ -1,59 +1,173 @@
-use std::path::Path;
+//! Process-level configuration, read from the environment.
+//!
+//! The split is deliberate: schedules and job definitions live in the jobs file
+//! where they can be edited without a rebuild, while secrets and paths stay in
+//! the environment where they can be kept out of version control.
 
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+
+/// The default jobs file, relative to the working directory.
+const DEFAULT_JOBS_FILE: &str = "jobs.toml";
+/// The default directory for generated data and the run history.
+const DEFAULT_DATA_DIR: &str = "./data";
+/// The default address for the status server.
+const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8787";
+/// The default retention window for run history.
+const DEFAULT_HISTORY_DAYS: u32 = 30;
+
+/// Everything the manager itself needs to start.
 pub struct Config {
-    pub last_fm_username: String,
+    /// Path to the jobs file.
+    pub jobs_file: PathBuf,
+    /// Directory for generated files and the run history database.
+    pub data_dir: String,
+    /// Address the status server binds to, or `None` when it is disabled.
+    pub http_addr: Option<String>,
+    /// How many days of run history to keep.
+    pub history_days: u32,
+    /// Last.fm settings, present only when the environment supplies them.
+    ///
+    /// Shared behind an `Arc` because every Last.fm built-in holds onto it.
+    pub lastfm: Option<Arc<LastFmSettings>>,
+}
+
+/// Credentials and paths for the Last.fm built-ins.
+pub struct LastFmSettings {
+    /// The Last.fm account to read.
+    pub username: String,
+    /// Where the JSON exports are written.
     pub destination_folder: String,
-    pub gist_id: String,
-    pub github_token: String,
-    pub gist_filename: String,
+    /// Path to the scrobble history database.
     pub db_file: String,
+    /// Gist target, present only when a token and gist ID are configured.
+    pub gist: Option<GistSettings>,
+}
+
+/// Where the gist built-in publishes.
+pub struct GistSettings {
+    /// A GitHub token with the `gist` scope.
+    pub token: String,
+    /// The target gist ID.
+    pub id: String,
+    /// The file within the gist to overwrite.
+    pub filename: String,
 }
 
 impl Config {
-    pub fn load() -> Result<Self, String> {
-        let last_fm_username = std::env::var("LAST_FM_USERNAME")
-            .map_err(|_| String::from("Missing env var: LAST_FM_USERNAME"))?;
+    /// Reads configuration from the environment.
+    ///
+    /// Only the manager's own settings are required. Last.fm is optional so the
+    /// binary runs as a plain cron manager on a host with no Last.fm at all.
+    pub fn from_env() -> Result<Self> {
+        let data_dir = env_or(DEFAULT_DATA_DIR, "DATA_DIR");
 
-        let destination_folder = std::env::var("DESTINATION_FOLDER")
-            .map_err(|_| String::from("Missing env var: DESTINATION_FOLDER"))?;
+        let jobs_file = std::env::var("JOBS_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(DEFAULT_JOBS_FILE));
 
-        let gist_id =
-            std::env::var("GIST_ID").map_err(|_| String::from("Missing env var: GIST_ID"))?;
+        let http_addr = match std::env::var("HTTP_ADDR") {
+            // An explicit empty value is the documented way to turn the server off.
+            Ok(addr) if addr.trim().is_empty() => None,
+            Ok(addr) => Some(addr),
+            Err(_) => Some(DEFAULT_HTTP_ADDR.to_string()),
+        };
 
-        let github_token = std::env::var("GITHUB_TOKEN")
-            .map_err(|_| String::from("Missing env var: GITHUB_TOKEN"))?;
-
-        let gist_filename = std::env::var("GIST_FILENAME").unwrap_or_else(|_| String::from("top-tracks.md"));
-
-        let db_file = std::env::var("DB_FILE")
-            .map_err(|_| String::from("Missing env var: DB_FILE"))?;
+        let history_days = match std::env::var("HISTORY_RETENTION_DAYS") {
+            Ok(raw) => raw
+                .trim()
+                .parse()
+                .with_context(|| format!("HISTORY_RETENTION_DAYS is not a number: '{raw}'"))?,
+            Err(_) => DEFAULT_HISTORY_DAYS,
+        };
 
         Ok(Self {
-            last_fm_username,
-            destination_folder,
-            gist_id,
-            github_token,
-            gist_filename,
-            db_file,
+            jobs_file,
+            lastfm: LastFmSettings::from_env(&data_dir).map(Arc::new),
+            data_dir,
+            http_addr,
+            history_days,
         })
     }
 
-    pub fn ensure_destination_folder(&self) -> Result<(), String> {
-        let path = Path::new(&self.destination_folder);
-        if path.exists() {
-            if path.is_dir() {
-                return Ok(());
-            }
-            return Err(format!(
-                "Destination path exists but is not a directory: {}",
-                self.destination_folder
-            ));
-        }
-        std::fs::create_dir_all(path).map_err(|e| {
-            format!(
-                "Failed to create destination folder '{}': {}",
-                self.destination_folder, e
-            )
+    /// Creates the data directory, failing if the path is taken by a file.
+    pub fn ensure_data_dir(&self) -> Result<()> {
+        ensure_dir(&self.data_dir)
+    }
+}
+
+impl LastFmSettings {
+    /// Reads the Last.fm settings, returning `None` when the account is unset.
+    ///
+    /// `LAST_FM_USERNAME` is the switch: without it there is nothing to fetch,
+    /// so the Last.fm built-ins simply do not get registered.
+    fn from_env(data_dir: &str) -> Option<Self> {
+        let username = non_empty_env("LAST_FM_USERNAME")?;
+
+        let destination_folder = env_or(data_dir, "DESTINATION_FOLDER");
+
+        let db_file = std::env::var("LAST_FM_DB_FILE")
+            .or_else(|_| std::env::var("DB_FILE"))
+            .unwrap_or_else(|_| {
+                Path::new(data_dir)
+                    .join("scrobbles.db")
+                    .display()
+                    .to_string()
+            });
+
+        Some(Self {
+            username,
+            destination_folder,
+            db_file,
+            gist: GistSettings::from_env(),
         })
     }
+
+    /// Creates the folder the JSON exports are written to.
+    pub fn ensure_destination_folder(&self) -> Result<()> {
+        ensure_dir(&self.destination_folder)
+    }
+}
+
+impl GistSettings {
+    /// Reads the gist target, returning `None` unless both token and ID are set.
+    fn from_env() -> Option<Self> {
+        Some(Self {
+            token: non_empty_env("GITHUB_TOKEN")?,
+            id: non_empty_env("GIST_ID")?,
+            filename: non_empty_env("GIST_FILENAME")
+                .unwrap_or_else(|| "top-tracks.md".to_string()),
+        })
+    }
+}
+
+/// Reads an environment variable, treating blank values as unset.
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Reads an environment variable, falling back to `default`.
+fn env_or(default: &str, key: &str) -> String {
+    non_empty_env(key).unwrap_or_else(|| default.to_string())
+}
+
+/// Creates `dir` if needed, rejecting a path already taken by a file.
+fn ensure_dir(dir: &str) -> Result<()> {
+    let path = Path::new(dir);
+
+    if path.is_dir() {
+        return Ok(());
+    }
+
+    anyhow::ensure!(
+        !path.exists(),
+        "Path exists but is not a directory: '{dir}'"
+    );
+
+    std::fs::create_dir_all(path).with_context(|| format!("Failed to create directory '{dir}'"))
 }
