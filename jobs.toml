@@ -77,3 +77,27 @@ args = { filename = "github_activity.json", issues_limit = 20, prs_limit = 20, s
 # enabled = false
 # timeout = "10m"
 # kind = { shell = "certbot renew --quiet && systemctl reload nginx" }
+
+# ---------------------------------------------------------------------------
+# atkuzu
+# Ported from atkuzu's own scripts/schedule-daily.ts (a node-schedule process
+# under pm2) to a shell_file job here instead: pnpm/pm2/node/node-schedule
+# idling 23 hours out of 24 just to fire one shell chain once a day cost
+# ~53MB RSS for nothing this scheduler already does generically.
+#
+# The logic itself lives in scripts/atkuzu-daily.sh (chmod +x'd), rather than
+# as an escaped one-liner here: `tz` only controls *when* this fires
+# (Europe/Paris local midnight, correct across the DST transition), the
+# script still computes that same date itself via TZ=Europe/Paris, since it
+# otherwise runs in the VPS's own system time (UTC), not Paris time.
+#
+# generate-daily.ts reads ATKUZU_DAILY_SEED from workdir's own .env (dotenv),
+# so it doesn't need to be repeated in `env` here.
+# ---------------------------------------------------------------------------
+
+[[jobs]]
+name = "atkuzu-daily"
+schedule = "0 0 0 * * *"        # midnight, Europe/Paris (see the tz field)
+tz = "Europe/Paris"
+timeout = "10m"
+kind = { shell_file = { path = "scripts/atkuzu-daily.sh", workdir = "/home/deploy/Desktop/atkuzu", env = { PATH = "/home/deploy/.volta/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" } } }

@@ -36,13 +36,28 @@ Every job accepts:
 | --- | --- | --- |
 | `name` | required | Unique name, used in logs, history and the HTTP API |
 | `schedule` | required | Six-field cron expression |
-| `kind` | required | `{ shell = "..." }` or `{ builtin = "..." }` |
+| `tz` | `"UTC"` | Timezone the schedule's fields are read in, e.g. `"Europe/Paris"` |
+| `kind` | required | `{ shell = "..." }`, `{ shell_file = "..." }` or `{ builtin = "..." }` |
 | `enabled` | `true` | Set to `false` to keep a declaration without running it |
 | `timeout` | none | Kill the run after this long, e.g. `"30s"`, `"10m"`, `"1h"` |
 | `run_on_start` | `false` | Run once at startup instead of waiting for the first occurrence |
 | `args` | `{}` | Parameters passed to the job |
 
-The whole file is validated at startup, including disabled jobs, so a typo cannot lie dormant until the day you switch it on. An unknown builtin or an unparseable cron expression stops the process immediately rather than at 3am.
+The whole file is validated at startup, including disabled jobs, so a typo cannot lie dormant until the day you switch it on. An unknown builtin, an unparseable cron expression, or an unrecognised `tz` name stops the process immediately rather than at 3am.
+
+### Timezones
+
+`schedule`'s fields are evaluated as wall-clock time in `tz`, IANA names like `"Europe/Paris"` or `"America/New_York"` (see the [tz database list](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)). This is what keeps a schedule like "local midnight" landing on local midnight across a DST transition, rather than drifting by an hour twice a year the way a fixed UTC cron hour would:
+
+```toml
+[[jobs]]
+name = "paris-midnight"
+schedule = "0 0 0 * * *"        # 00:00 Europe/Paris, every day
+tz = "Europe/Paris"
+kind = { shell = "..." }
+```
+
+The shell command itself still runs in the machine's own system time (UTC on most VPS installs), not `tz`. `tz` only decides *when* the job fires; anything the command needs to know about "today" in that same zone (a date to stamp a filename with, say) has to ask for it explicitly, e.g. `TZ=Europe/Paris date +%Y-%m-%d`.
 
 ### Shell jobs
 
@@ -59,6 +74,24 @@ kind = { shell = { command = "make deploy", workdir = "/srv/app", env = { RUST_L
 ```
 
 Two variables are always set for the command: `VPS_CRON_JOB` holds the job name and `VPS_CRON_STARTED_AT` holds the run's start time in RFC 3339.
+
+### Shell file jobs
+
+For anything longer than a one-liner, `shell_file` runs a script directly instead of an inline command wedged into TOML:
+
+```toml
+kind = { shell_file = "scripts/nightly-backup.sh" }
+```
+
+Unlike `shell`, this does not go through `sh -c`: the file is spawned directly, so it needs to be executable (`chmod +x`) and start with its own shebang, e.g. `#!/usr/bin/env bash`. That is also what lets it use bash, Python, or anything else, rather than being limited to whatever `/bin/sh` happens to be on the box. A file that is not executable fails with a clear error pointing at the fix, rather than a confusing "No such file or directory" from the OS.
+
+The longer form adds a working directory, extra environment variables, and arguments:
+
+```toml
+kind = { shell_file = { path = "scripts/nightly-backup.sh", workdir = "/srv/app", env = { RUST_LOG = "info" }, args = ["--force"] } }
+```
+
+`path` is resolved relative to vps-cron's own working directory (like `jobs.toml` itself), not `workdir`: `workdir` only changes the *script's* current directory once it is running, the same way it does for a `shell` job. The same `VPS_CRON_JOB` and `VPS_CRON_STARTED_AT` variables are set as for `shell`. A missing file is caught at startup, alongside every other validation error, not on the first run.
 
 ### The `filename` argument
 

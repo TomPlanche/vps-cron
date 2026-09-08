@@ -13,13 +13,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use cron::Schedule;
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-use crate::builtins::shell::ShellJob;
+use crate::builtins::shell::{ShellFileJob, ShellJob};
 use crate::history::History;
 use crate::job::{Job, JobContext, JobFailure, JobReport, JobResult, Outcome, RunRecord};
 use crate::jobs_file::{JobKind, JobSpec, JobsFile};
@@ -76,6 +77,9 @@ impl JobStatus {
 struct ScheduledJob {
     spec: JobSpec,
     schedule: Schedule,
+    /// The zone `schedule`'s fields are evaluated in; copied out of `spec.tz` so the
+    /// scheduling loop doesn't need to reach back into `spec` every tick.
+    tz: Tz,
     job: Arc<dyn Job>,
     /// Held for the duration of a run; a taken guard means "still running".
     guard: Arc<Mutex<()>>,
@@ -115,12 +119,14 @@ impl Scheduler {
             }
 
             let schedule = spec.parse_schedule()?;
+            let tz = spec.tz;
 
             let job = resolve(&spec, registry)?;
 
             jobs.push(ScheduledJob {
                 spec,
                 schedule,
+                tz,
                 job,
                 guard: Arc::new(Mutex::new(())),
             });
@@ -193,7 +199,7 @@ impl Runner {
         loop {
             let now = Utc::now();
 
-            let Some(delay) = next_delay(&job.schedule, now) else {
+            let Some(delay) = next_delay(&job.schedule, job.tz, now) else {
                 // A schedule with nothing left ahead of it (a fixed date in the
                 // past, say) would otherwise spin. Stop driving it instead.
                 warn!(job = %name, "Schedule has no further occurrences, stopping this job");
@@ -201,8 +207,11 @@ impl Runner {
                 return;
             };
 
-            self.set_next_run(&name, Some(now + chrono::Duration::from_std(delay).unwrap_or_default()))
-                .await;
+            self.set_next_run(
+                &name,
+                Some(now + chrono::Duration::from_std(delay).unwrap_or_default()),
+            )
+            .await;
 
             tokio::time::sleep(delay).await;
             self.dispatch(Arc::clone(&job)).await;
@@ -226,7 +235,8 @@ impl Runner {
         let file_lock = match self.locks.try_acquire(&name) {
             Ok(Some(lock)) => lock,
             Ok(None) => {
-                self.skip(&name, "another process holds this job's lock").await;
+                self.skip(&name, "another process holds this job's lock")
+                    .await;
                 return;
             }
             Err(error) => {
@@ -338,6 +348,7 @@ impl Runner {
 pub fn resolve(spec: &JobSpec, registry: &Registry) -> Result<Arc<dyn Job>> {
     match &spec.kind {
         JobKind::Shell(command) => Ok(Arc::new(ShellJob::new(command.clone()))),
+        JobKind::ShellFile(file) => Ok(Arc::new(ShellFileJob::new(file.clone()))),
         JobKind::Builtin(name) => registry
             .resolve(name)
             .with_context(|| format!("Job '{}' could not be resolved", spec.name)),
@@ -401,13 +412,22 @@ fn to_record(
     }
 }
 
-/// How long to wait for the next occurrence of `schedule` after `now`.
+/// How long to wait for the next occurrence of `schedule` after `now`, with the
+/// schedule's fields read as wall-clock time in `tz`.
 ///
 /// Sub-second precision matters here: truncating to whole seconds makes a
 /// short schedule (every five seconds, say) wake early and spin.
-fn next_delay(schedule: &Schedule, now: DateTime<Utc>) -> Option<Duration> {
-    let next = schedule.after(&now).next()?;
-    Some((next - now).to_std().unwrap_or(Duration::ZERO))
+///
+/// Evaluating in `tz` rather than always in UTC is what keeps a schedule like "local
+/// midnight" correct across a DST transition: `cron`'s `after` reads the hour/minute
+/// fields off whatever `DateTime` it's given, so converting `now` into the job's zone
+/// first makes "midnight" mean midnight there, not a fixed UTC offset that drifts by an
+/// hour twice a year.
+fn next_delay(schedule: &Schedule, tz: Tz, now: DateTime<Utc>) -> Option<Duration> {
+    let now_in_tz = now.with_timezone(&tz);
+    let next = schedule.after(&now_in_tz).next()?;
+    let next_utc = next.with_timezone(&Utc);
+    Some((next_utc - now).to_std().unwrap_or(Duration::ZERO))
 }
 
 #[cfg(test)]
@@ -422,7 +442,8 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
 
-        let delay = next_delay(&schedule, now).expect("a 5s schedule always has a next tick");
+        let delay =
+            next_delay(&schedule, Tz::UTC, now).expect("a 5s schedule always has a next tick");
 
         // Truncating to whole seconds would give 4s here and wake 900ms early.
         assert_eq!(delay, Duration::from_millis(4_900));
@@ -434,7 +455,7 @@ mod tests {
         let schedule = Schedule::from_str("0 0 0 1 1 * 2020").unwrap();
         let now = Utc::now();
 
-        assert!(next_delay(&schedule, now).is_none());
+        assert!(next_delay(&schedule, Tz::UTC, now).is_none());
     }
 
     #[test]
@@ -444,6 +465,37 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
 
-        assert_eq!(next_delay(&schedule, now), Some(Duration::from_secs(1_800)));
+        assert_eq!(
+            next_delay(&schedule, Tz::UTC, now),
+            Some(Duration::from_secs(1_800))
+        );
+    }
+
+    #[test]
+    fn local_midnight_tracks_dst_instead_of_a_fixed_utc_offset() {
+        let schedule = Schedule::from_str("0 0 0 * * *").unwrap();
+
+        // Winter: CET is UTC+1, so Paris midnight is 23:00 UTC the day before.
+        let winter = DateTime::parse_from_rfc3339("2026-01-15T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let winter_next = winter
+            + chrono::Duration::from_std(
+                next_delay(&schedule, chrono_tz::Europe::Paris, winter).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(winter_next.format("%H:%M:%S").to_string(), "23:00:00");
+
+        // Summer: CEST is UTC+2, so the same local-midnight schedule now lands an hour
+        // earlier in UTC. A fixed "23:00 UTC" cron expression would miss this entirely.
+        let summer = DateTime::parse_from_rfc3339("2026-07-15T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let summer_next = summer
+            + chrono::Duration::from_std(
+                next_delay(&schedule, chrono_tz::Europe::Paris, summer).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(summer_next.format("%H:%M:%S").to_string(), "22:00:00");
     }
 }
