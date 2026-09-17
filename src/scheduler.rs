@@ -101,7 +101,13 @@ impl Scheduler {
     /// Resolution happens up front so an unknown builtin or an unusable
     /// schedule stops the process at startup, rather than at 3am on the first
     /// occurrence.
-    pub fn build(
+    ///
+    /// Each job's `last_run` is seeded from the history so a restart does not
+    /// make every job look like it has never run: `/health`'s failing list and
+    /// the dashboard's "last" field would otherwise go blank until the job's
+    /// next occurrence, hiding a real failure from right before the restart.
+    /// One indexed query per job gets it back; nothing new is stored.
+    pub async fn build(
         file: JobsFile,
         registry: &Registry,
         history: History,
@@ -111,7 +117,9 @@ impl Scheduler {
         let mut status = BTreeMap::new();
 
         for spec in file.jobs {
-            status.insert(spec.name.clone(), JobStatus::new(&spec));
+            let mut job_status = JobStatus::new(&spec);
+            job_status.last_run = last_recorded_run(&history, &spec.name).await;
+            status.insert(spec.name.clone(), job_status);
 
             if !spec.enabled {
                 info!(job = %spec.name, "Job is disabled, skipping");
@@ -342,6 +350,21 @@ impl Runner {
     }
 }
 
+/// The most recent run recorded for `name`, if the history has one.
+///
+/// A read failure here must not stop the manager from starting: it just means
+/// the job's `last_run` stays empty until it runs again, same as before this
+/// existed.
+async fn last_recorded_run(history: &History, name: &str) -> Option<RunRecord> {
+    match history.recent(Some(name.to_string()), 1).await {
+        Ok(runs) => runs.into_iter().next(),
+        Err(error) => {
+            warn!(job = %name, "Failed to read the last run from history: {error:#}");
+            None
+        }
+    }
+}
+
 /// Resolves one job declaration into something runnable.
 ///
 /// Shared by the scheduler and by `vps-cron run`, so a job behaves identically
@@ -444,6 +467,68 @@ fn next_delay(schedule: &Schedule, tz: Tz, now: DateTime<Utc>) -> Option<Duratio
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    use crate::jobs_file::ShellCommand;
+
+    #[tokio::test]
+    async fn build_seeds_last_run_from_the_history_so_a_restart_does_not_blank_it() {
+        let dir = std::env::temp_dir().join(format!("vps-cron-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let history_path = dir.join("scheduler-seed.db");
+        let _ = std::fs::remove_file(&history_path);
+
+        // Stands in for a run recorded by a process that has since exited,
+        // the way any run would look right after a restart.
+        let history = History::open(&history_path).unwrap();
+        history
+            .record(RunRecord {
+                job: "backup".to_string(),
+                started_at: Utc::now(),
+                finished_at: Utc::now(),
+                duration_ms: 42,
+                outcome: Outcome::Failure,
+                trigger: Trigger::Manual,
+                summary: "disk full".to_string(),
+                output: None,
+            })
+            .await
+            .unwrap();
+
+        let jobs_file = JobsFile {
+            jobs: vec![JobSpec {
+                name: "backup".to_string(),
+                schedule: "0 0 0 1 1 * 2099".to_string(),
+                tz: Tz::UTC,
+                enabled: false,
+                kind: JobKind::Shell(ShellCommand::Line("true".to_string())),
+                timeout: None,
+                run_on_start: false,
+                args: toml::Table::new(),
+            }],
+        };
+
+        let locks = LockDir::new(dir.join("locks").to_str().unwrap()).unwrap();
+        let registry = Registry::new();
+
+        let scheduler = Scheduler::build(jobs_file, &registry, history, locks)
+            .await
+            .unwrap();
+
+        let status = scheduler.status();
+        let status = status.read().await;
+        let last_run = status
+            .get("backup")
+            .and_then(|entry| entry.last_run.as_ref())
+            .expect("last_run should be seeded from the history, not empty after a fresh build");
+
+        // A restart that lost this would also hide the failure from `/health`
+        // until the job's next occurrence, which for a disabled job is never.
+        assert_eq!(last_run.outcome, Outcome::Failure);
+        assert_eq!(last_run.trigger, Trigger::Manual);
+        assert_eq!(last_run.summary, "disk full");
+
+        let _ = std::fs::remove_file(&history_path);
+    }
 
     #[test]
     fn sub_second_delays_survive() {

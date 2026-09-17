@@ -79,7 +79,7 @@ async fn serve(config: Config, jobs_file: JobsFile) -> Result<()> {
     let history = History::open(&history::default_path(&config.data_dir))?;
     let locks = LockDir::new(&config.data_dir)?;
 
-    let scheduler = Scheduler::build(jobs_file, &registry, history.clone(), locks)?;
+    let scheduler = Scheduler::build(jobs_file, &registry, history.clone(), locks).await?;
 
     if scheduler.enabled_count() == 0 {
         warn!(
