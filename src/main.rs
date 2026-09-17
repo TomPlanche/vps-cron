@@ -28,6 +28,7 @@ use builtins::lastfm::LastFm;
 use cli::Command;
 use config::Config;
 use history::History;
+use job::Trigger;
 use jobs_file::{JobSpec, JobsFile};
 use lock::LockDir;
 use registry::Registry;
@@ -142,7 +143,7 @@ async fn run_one(config: &Config, jobs_file: JobsFile, name: &str) -> Result<()>
         eprintln!("Note: '{name}' is disabled in the jobs file, running it anyway.");
     }
 
-    let record = scheduler::execute_once(spec, job.as_ref()).await;
+    let record = scheduler::execute_once(spec, job.as_ref(), Trigger::Manual).await;
 
     println!("{}: {}", record.outcome, record.summary);
     println!("took {} ms", record.duration_ms);

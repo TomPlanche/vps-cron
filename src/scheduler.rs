@@ -22,7 +22,7 @@ use tracing::{error, info, warn};
 
 use crate::builtins::shell::{ShellFileJob, ShellJob};
 use crate::history::History;
-use crate::job::{Job, JobContext, JobFailure, JobReport, JobResult, Outcome, RunRecord};
+use crate::job::{Job, JobContext, JobFailure, JobReport, JobResult, Outcome, RunRecord, Trigger};
 use crate::jobs_file::{JobKind, JobSpec, JobsFile};
 use crate::lock::LockDir;
 use crate::registry::Registry;
@@ -268,6 +268,7 @@ impl Runner {
                 finished_at: now,
                 duration_ms: 0,
                 outcome: Outcome::Skipped,
+                trigger: Trigger::Scheduled,
                 summary: format!("Skipped: {reason}"),
                 output: None,
             },
@@ -280,7 +281,7 @@ impl Runner {
         let name = &job.spec.name;
 
         self.set_running(name, true).await;
-        let record = execute_once(&job.spec, job.job.as_ref()).await;
+        let record = execute_once(&job.spec, job.job.as_ref(), Trigger::Scheduled).await;
 
         match record.outcome {
             Outcome::Success => {
@@ -360,7 +361,7 @@ pub fn resolve(spec: &JobSpec, registry: &Registry) -> Result<Arc<dyn Job>> {
 /// This is the single place a job actually gets executed. Timeouts are tracked
 /// as a flag rather than sniffed out of the error message afterwards, so a job
 /// that legitimately reports "timed out" itself is not miscategorised.
-pub async fn execute_once(spec: &JobSpec, job: &dyn Job) -> RunRecord {
+pub async fn execute_once(spec: &JobSpec, job: &dyn Job, trigger: Trigger) -> RunRecord {
     let started_at = Utc::now();
     let start = std::time::Instant::now();
 
@@ -384,7 +385,14 @@ pub async fn execute_once(spec: &JobSpec, job: &dyn Job) -> RunRecord {
         None => (job.run(&ctx).await, false),
     };
 
-    to_record(&spec.name, started_at, start.elapsed(), outcome, timed_out)
+    to_record(
+        &spec.name,
+        started_at,
+        start.elapsed(),
+        outcome,
+        timed_out,
+        trigger,
+    )
 }
 
 /// Turns a job result into the record written to the history.
@@ -394,6 +402,7 @@ fn to_record(
     elapsed: Duration,
     outcome: JobResult,
     timed_out: bool,
+    trigger: Trigger,
 ) -> RunRecord {
     let (result, summary, output) = match outcome {
         Ok(JobReport { summary, output }) => (Outcome::Success, summary, output),
@@ -407,6 +416,7 @@ fn to_record(
         finished_at: Utc::now(),
         duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
         outcome: result,
+        trigger,
         summary,
         output,
     }

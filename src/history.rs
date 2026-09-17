@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rusqlite::{params, Connection};
 
-use crate::job::{Outcome, RunRecord};
+use crate::job::{Outcome, RunRecord, Trigger};
 
 /// Handle to the run-history database.
 #[derive(Clone)]
@@ -49,12 +49,27 @@ impl History {
                  duration_ms  INTEGER NOT NULL,
                  outcome      TEXT    NOT NULL,
                  summary      TEXT    NOT NULL,
-                 output       TEXT
+                 output       TEXT,
+                 trigger      TEXT    NOT NULL DEFAULT 'scheduled'
              );
              CREATE INDEX IF NOT EXISTS idx_runs_job_started ON runs (job, id DESC);
              CREATE INDEX IF NOT EXISTS idx_runs_started ON runs (id DESC);",
         )
         .context("Failed to initialise the history schema")?;
+
+        // A database created before the `trigger` column existed has a `runs`
+        // table `CREATE TABLE IF NOT EXISTS` leaves untouched, so it needs its
+        // own migration rather than living in the schema above.
+        let has_trigger_column = conn
+            .prepare("SELECT trigger FROM runs LIMIT 1")
+            .is_ok();
+        if !has_trigger_column {
+            conn.execute(
+                "ALTER TABLE runs ADD COLUMN trigger TEXT NOT NULL DEFAULT 'scheduled'",
+                [],
+            )
+            .context("Failed to add the trigger column to the history schema")?;
+        }
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -68,8 +83,8 @@ impl History {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().expect("history mutex poisoned");
             conn.execute(
-                "INSERT INTO runs (job, started_at, finished_at, duration_ms, outcome, summary, output)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO runs (job, started_at, finished_at, duration_ms, outcome, summary, output, trigger)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     record.job,
                     record.started_at.to_rfc3339(),
@@ -78,6 +93,7 @@ impl History {
                     record.outcome.as_str(),
                     record.summary,
                     record.output,
+                    record.trigger.as_str(),
                 ],
             )?;
             Ok::<_, rusqlite::Error>(())
@@ -99,12 +115,12 @@ impl History {
             let conn = conn.lock().expect("history mutex poisoned");
             let (sql, args): (&str, Vec<Box<dyn rusqlite::ToSql>>) = match &job {
                 Some(name) => (
-                    "SELECT job, started_at, finished_at, duration_ms, outcome, summary, output
+                    "SELECT job, started_at, finished_at, duration_ms, outcome, summary, output, trigger
                      FROM runs WHERE job = ?1 ORDER BY id DESC LIMIT ?2",
                     vec![Box::new(name.clone()), Box::new(limit)],
                 ),
                 None => (
-                    "SELECT job, started_at, finished_at, duration_ms, outcome, summary, output
+                    "SELECT job, started_at, finished_at, duration_ms, outcome, summary, output, trigger
                      FROM runs ORDER BY id DESC LIMIT ?1",
                     vec![Box::new(limit)],
                 ),
@@ -124,6 +140,7 @@ impl History {
                         outcome: Outcome::from_str_lossy(&row.get::<_, String>(4)?),
                         summary: row.get(5)?,
                         output: row.get(6)?,
+                        trigger: Trigger::from_str_lossy(&row.get::<_, String>(7)?),
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -184,6 +201,7 @@ mod tests {
             finished_at: now,
             duration_ms: 12,
             outcome,
+            trigger: Trigger::Scheduled,
             summary: format!("{job} {outcome}"),
             output: None,
         }
@@ -212,6 +230,73 @@ mod tests {
 
         let limited = history.recent(None, 1).await.unwrap();
         assert_eq!(limited.len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_database_from_before_the_trigger_column_still_opens() {
+        let dir = std::env::temp_dir().join(format!("vps-cron-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history-pre-trigger.db");
+        let _ = std::fs::remove_file(&path);
+
+        // Builds the table as it looked before `trigger` existed, then opens
+        // it through `History::open` to exercise the migration.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE runs (
+                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                     job          TEXT    NOT NULL,
+                     started_at   TEXT    NOT NULL,
+                     finished_at  TEXT    NOT NULL,
+                     duration_ms  INTEGER NOT NULL,
+                     outcome      TEXT    NOT NULL,
+                     summary      TEXT    NOT NULL,
+                     output       TEXT
+                 );
+                 INSERT INTO runs (job, started_at, finished_at, duration_ms, outcome, summary, output)
+                 VALUES ('old-job', '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z', 1000, 'success', 'ok', NULL);",
+            )
+            .unwrap();
+        }
+
+        let history = History::open(&path).unwrap();
+        let runs = history.recent(None, 10).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].job, "old-job");
+        assert_eq!(
+            runs[0].trigger,
+            Trigger::Scheduled,
+            "a row from before the column existed should read back as the default"
+        );
+
+        history.record(record("new-job", Outcome::Success)).await.unwrap();
+        let all = history.recent(None, 10).await.unwrap();
+        assert_eq!(all.len(), 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn records_and_reads_back_the_trigger() {
+        let dir = std::env::temp_dir().join(format!("vps-cron-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history-trigger.db");
+        let _ = std::fs::remove_file(&path);
+
+        let history = History::open(&path).unwrap();
+
+        let mut manual = record("alpha", Outcome::Success);
+        manual.trigger = Trigger::Manual;
+        history.record(manual).await.unwrap();
+        history.record(record("alpha", Outcome::Success)).await.unwrap();
+
+        let runs = history.recent(Some("alpha".to_string()), 10).await.unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].trigger, Trigger::Scheduled, "newest run should come first");
+        assert_eq!(runs[1].trigger, Trigger::Manual);
 
         let _ = std::fs::remove_file(&path);
     }

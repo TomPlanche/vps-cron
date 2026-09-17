@@ -180,6 +180,43 @@ impl fmt::Display for Outcome {
     }
 }
 
+/// What started a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Trigger {
+    /// The scheduler started it on its configured cron schedule.
+    Scheduled,
+    /// A person started it by hand, with `vps-cron run <job>`.
+    Manual,
+}
+
+impl Trigger {
+    /// The wire and database representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scheduled => "scheduled",
+            Self::Manual => "manual",
+        }
+    }
+
+    /// Parses the representation produced by [`Trigger::as_str`].
+    ///
+    /// Unrecognised values become [`Trigger::Scheduled`] so a row written
+    /// before this field existed reads back as the common case.
+    pub fn from_str_lossy(raw: &str) -> Self {
+        match raw {
+            "manual" => Self::Manual,
+            _ => Self::Scheduled,
+        }
+    }
+}
+
+impl fmt::Display for Trigger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A completed run, as stored in the history and served over HTTP.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunRecord {
@@ -193,6 +230,8 @@ pub struct RunRecord {
     pub duration_ms: u64,
     /// How the run ended.
     pub outcome: Outcome,
+    /// What started this run.
+    pub trigger: Trigger,
     /// Single-line summary, or the error message for a failed run.
     pub summary: String,
     /// Captured output tail, if any.
