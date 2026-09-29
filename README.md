@@ -111,11 +111,12 @@ Built-ins are compiled in, so they can share one API client and keep typed acces
 | `lastfm_current_track` | `filename` (`currently_listening.json`) | Writes the currently playing track as JSON |
 | `lastfm_scrobbles_db` | `db_file` (`LAST_FM_DB_FILE`) | Appends new scrobbles to the SQLite listening history |
 | `lastfm_top_tracks_gist` | `limit` (5), `period` (`week`), `gist_id`, `gist_filename` | Renders top tracks as Markdown and pushes them to a GitHub gist |
+| `lastfm_recent_tracks_readme` | `repo` (required, `owner/name`), `limit` (10), `path` (`README.md`), `branch` (default branch), `timezone` (`Europe/Paris`) | Renders the last played tracks, with play time, total play count and loved marker, as a `<details>` block between `<!-- LASTFM:START -->` and `<!-- LASTFM:END -->` in a repository file, committing only when it changed. Play counts come from the `lastfm_scrobbles_db` database and are left out when it cannot be read |
 | `github_activity` | `filename` (`github_activity.json`), `issues_limit` (20), `prs_limit` (20), `starred_limit` (30), `repos_limit` (100), `review_requests_limit` (20) | Snapshots your GitHub activity as typed JSON |
 
 `period` accepts `overall`, `week`, `month`, `3month`, `6month` and `12month`.
 
-The GitHub built-ins need `GITHUB_TOKEN`. `github_activity` reads public data only, so a token with no scopes at all is enough; `lastfm_top_tracks_gist` additionally needs the `gist` scope.
+The GitHub built-ins need `GITHUB_TOKEN`. `github_activity` reads public data only, so a token with no scopes at all is enough; `lastfm_top_tracks_gist` additionally needs the `gist` scope. `lastfm_recent_tracks_readme` needs write access to the target repository's contents (`public_repo` on a classic token, or "Contents: read and write" on a fine-grained one).
 
 Referencing a builtin that is not registered fails at startup with the list of names that are, which is usually the clue that a credential is missing.
 

@@ -13,12 +13,17 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
+use chrono_tz::Tz;
 use lastfm_client::{api::Period, prelude::*, LastFmClient};
+use tracing::warn;
 
 use crate::builtins::write_json;
 use crate::config::{GitHubSettings, LastFmSettings};
 use crate::job::{Job, JobContext, JobReport, JobResult};
 use crate::update_gist::{format_top_tracks_markdown, update_gist};
+use crate::update_readme::{
+    format_recent_tracks_details, load_track_stats, update_readme_section, RepoFile,
+};
 
 /// Shared state handed to every Last.fm built-in.
 pub struct LastFm {
@@ -183,6 +188,94 @@ impl Job for TopTracksGist {
             top_tracks.len()
         ))
         .with_output(content))
+    }
+}
+
+/// Renders the last played tracks into a section of a repository file, such
+/// as a GitHub profile README.
+///
+/// Arguments: `repo` (`owner/name`, required), `limit` (default 10), `path`
+/// (default `README.md`), `branch` (default: the repository default branch),
+/// `timezone` (default `Europe/Paris`).
+///
+/// Play counts and loved markers come from the `lastfm_scrobbles_db`
+/// database. When it cannot be read, the list is published without them.
+///
+/// The file must contain the `<!-- LASTFM:START -->` and `<!-- LASTFM:END -->`
+/// markers. A commit is only made when the section actually changed.
+pub struct RecentTracksReadme(pub Arc<LastFm>);
+
+#[async_trait]
+impl Job for RecentTracksReadme {
+    async fn run(&self, ctx: &JobContext<'_>) -> JobResult {
+        let github = self
+            .0
+            .github
+            .as_ref()
+            .context("GITHUB_TOKEN must be set to update a README")?;
+
+        let repo = ctx
+            .arg_str("repo")
+            .context("The 'repo' argument (owner/name) is required")?;
+        let limit = ctx.arg_u32("limit").unwrap_or(10);
+        let tz_name = ctx.arg_str("timezone").unwrap_or("Europe/Paris");
+        let tz: Tz = tz_name
+            .parse()
+            .map_err(|_| anyhow!("Unknown timezone '{tz_name}'"))?;
+        let target = RepoFile {
+            repo,
+            path: ctx.arg_str("path").unwrap_or("README.md"),
+            branch: ctx.arg_str("branch"),
+        };
+
+        // One extra, because a currently playing track takes a slot and is dropped.
+        let tracks = self
+            .0
+            .client
+            .recent_tracks(&self.0.settings.username)
+            .limit(limit + 1)
+            .fetch()
+            .await
+            .map_err(|e| anyhow!("{e:?}"))
+            .context("Failed to fetch recent plays")?;
+
+        let played: Vec<_> = tracks
+            .into_iter()
+            .filter(|t| t.attr.is_none())
+            .take(limit as usize)
+            .collect();
+
+        // Stats are a nice-to-have: a missing or locked database should not
+        // stop the list itself from being published.
+        let db_file = self.0.settings.db_file.clone();
+        let lookup = played.clone();
+        let stats = match tokio::task::spawn_blocking(move || load_track_stats(&db_file, &lookup))
+            .await
+            .context("The stats lookup panicked")?
+        {
+            Ok(stats) => Some(stats),
+            Err(err) => {
+                warn!("Publishing without play counts: {err:#}");
+                None
+            }
+        };
+
+        let section = format_recent_tracks_details(&played, stats.as_deref(), tz);
+        let committed = update_readme_section(
+            &section,
+            &github.token,
+            &target,
+            "chore: update last played songs",
+        )
+        .await?;
+
+        let summary = if committed {
+            format!("Committed {} tracks to {repo}/{}", played.len(), target.path)
+        } else {
+            format!("{repo}/{} already up to date", target.path)
+        };
+
+        Ok(JobReport::summary(summary).with_output(section))
     }
 }
 

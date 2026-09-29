@@ -12,7 +12,7 @@
 # ---------------------------------------------------------------------------
 # Last.fm
 # These need LAST_FM_USERNAME in the environment; the gist job also needs
-# GITHUB_TOKEN and GIST_ID.
+# GITHUB_TOKEN and GIST_ID, the README job needs GITHUB_TOKEN.
 # ---------------------------------------------------------------------------
 
 [[jobs]]
@@ -39,6 +39,14 @@ name = "lastfm-top-tracks-gist"
 schedule = "0 0 * * * *"        # hourly, on the hour
 kind = { builtin = "lastfm_top_tracks_gist" }
 args = { limit = 5, period = "week" }
+timeout = "2m"
+
+# Commits only when the list changed, so each run adds at most one commit.
+[[jobs]]
+name = "lastfm-recent-tracks-readme"
+schedule = "0 0/30 * * * *"     # every 30 minutes
+kind = { builtin = "lastfm_recent_tracks_readme" }
+args = { repo = "TomPlanche/TomPlanche", limit = 10 }
 timeout = "2m"
 
 # ---------------------------------------------------------------------------

@@ -11,7 +11,9 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 
 use crate::builtins::github::Activity;
-use crate::builtins::lastfm::{CurrentTrack, LastFm, RecentPlays, ScrobblesDb, TopTracksGist};
+use crate::builtins::lastfm::{
+    CurrentTrack, LastFm, RecentPlays, RecentTracksReadme, ScrobblesDb, TopTracksGist,
+};
 use crate::config::GitHubSettings;
 use crate::job::Job;
 
@@ -32,7 +34,8 @@ impl Registry {
         self.insert("lastfm_recent_plays", Arc::new(RecentPlays(Arc::clone(&lastfm))));
         self.insert("lastfm_current_track", Arc::new(CurrentTrack(Arc::clone(&lastfm))));
         self.insert("lastfm_scrobbles_db", Arc::new(ScrobblesDb(Arc::clone(&lastfm))));
-        self.insert("lastfm_top_tracks_gist", Arc::new(TopTracksGist(lastfm)));
+        self.insert("lastfm_top_tracks_gist", Arc::new(TopTracksGist(Arc::clone(&lastfm))));
+        self.insert("lastfm_recent_tracks_readme", Arc::new(RecentTracksReadme(lastfm)));
         self
     }
 

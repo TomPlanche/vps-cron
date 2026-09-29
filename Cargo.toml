@@ -6,6 +6,7 @@ description = "A small cron manager for a VPS: schedules shell commands and buil
 
 [dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4.45", features = ["serde"] }

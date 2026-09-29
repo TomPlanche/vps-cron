@@ -23,6 +23,7 @@ mod lock;
 mod registry;
 mod scheduler;
 mod update_gist;
+mod update_readme;
 
 use builtins::lastfm::LastFm;
 use cli::Command;
