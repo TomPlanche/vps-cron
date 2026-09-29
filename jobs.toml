@@ -105,7 +105,7 @@ args = { filename = "github_activity.json", issues_limit = 20, prs_limit = 20, s
 
 [[jobs]]
 name = "atkuzu-daily"
-schedule = "0 0 0 * * *"        # midnight, Europe/Paris (see the tz field)
+schedule = "0 0 0 * * *"
 tz = "Europe/Paris"
 timeout = "10m"
-kind = { shell_file = { path = "scripts/atkuzu-daily.sh", workdir = "/home/deploy/Desktop/atkuzu", env = { PATH = "/home/deploy/.volta/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" } } }
+kind = { shell_file = { path = "/home/deploy/Desktop/atkuzu/scripts/generate-daily.sh", workdir = "/home/deploy/Desktop/atkuzu" } }
